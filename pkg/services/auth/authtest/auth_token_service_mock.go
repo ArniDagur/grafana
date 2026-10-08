@@ -351,6 +351,24 @@ func (_m *MockUserAuthTokenService) RotateToken(ctx context.Context, cmd auth.Ro
 	return r0, r1
 }
 
+// RotationPaused provides a mock function with no fields
+func (_m *MockUserAuthTokenService) RotationPaused() bool {
+	ret := _m.Called()
+
+	if len(ret) == 0 {
+		panic("no return value specified for RotationPaused")
+	}
+
+	var r0 bool
+	if rf, ok := ret.Get(0).(func() bool); ok {
+		r0 = rf()
+	} else {
+		r0 = ret.Get(0).(bool)
+	}
+
+	return r0
+}
+
 // UpdateExternalSession provides a mock function with given fields: ctx, externalSessionID, cmd
 func (_m *MockUserAuthTokenService) UpdateExternalSession(ctx context.Context, externalSessionID int64, cmd *auth.UpdateExternalSessionCommand) error {
 	ret := _m.Called(ctx, externalSessionID, cmd)

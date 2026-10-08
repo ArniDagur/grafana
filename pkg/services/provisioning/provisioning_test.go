@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/VividCortex/mysqlerr"
+	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
@@ -229,6 +231,36 @@ func TestProvisioningServiceImpl(t *testing.T) {
 
 		assert.True(t, errors.Is(serviceTest.serviceError, provisioningErr))
 	})
+
+	t.Run("Should start when provisioning fails because the database is read-only", func(t *testing.T) {
+		serviceTest := setup(t)
+		readOnlyErr := &mysql.MySQLError{
+			Number:  mysqlerr.ER_OPTION_PREVENTS_STATEMENT,
+			Message: "The MySQL server is running with the --super-read-only option so it cannot execute this statement",
+		}
+		serviceTest.service.provisionDatasources = func(context.Context, string, datasources.BaseDataSourceService, datasources.CorrelationsStore, org.Service) error {
+			return readOnlyErr
+		}
+		serviceTest.service.provisionPlugins = func(context.Context, string, pluginstore.Store, pluginsettings.Service, org.Service) error {
+			return readOnlyErr
+		}
+		serviceTest.service.provisionAlerting = func(context.Context, prov_alerting.ProvisionerConfig) error {
+			return readOnlyErr
+		}
+		serviceTest.mock.ProvisionFunc = func(context.Context) error {
+			return readOnlyErr
+		}
+		serviceTest.startService()
+
+		serviceTest.waitForPollChanges()
+		assert.Equal(t, 1, len(serviceTest.mock.Calls.PollChanges), "PollChanges should have been called")
+
+		serviceTest.cancel()
+		serviceTest.waitForStop()
+
+		assert.NoError(t, serviceTest.serviceError, "Service should not have returned an error")
+	})
+
 	t.Run("Should set dashboard provisioner when provisioning dashboards", func(t *testing.T) {
 		// The first dashboard provisioner instantiation takes place when
 		// setDashboardProvisioner() is called in setup(t).

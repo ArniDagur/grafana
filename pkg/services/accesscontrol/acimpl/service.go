@@ -37,6 +37,7 @@ import (
 	"github.com/grafana/grafana/pkg/services/featuremgmt"
 	"github.com/grafana/grafana/pkg/services/folder"
 	"github.com/grafana/grafana/pkg/services/pluginsintegration/pluginaccesscontrol"
+	"github.com/grafana/grafana/pkg/services/sqlstore"
 	"github.com/grafana/grafana/pkg/services/user"
 	"github.com/grafana/grafana/pkg/setting"
 )
@@ -613,6 +614,18 @@ func (s *Service) RegisterFixedRoles(ctx context.Context) error {
 	rolesSnapshot := s.getBasicRolePermissionsLocked()
 	s.rolesMu.Unlock()
 
+	if err := s.seedRolesInDB(ctx, registrations, rolesSnapshot); err != nil {
+		if !sqlstore.IsReadOnlyError(err) {
+			return err
+		}
+		// Let Grafana start while the database is read-only; the roles stored by the last successful seed stay in effect.
+		s.log.Warn("Database is read-only, skipping role seeding", "error", err)
+	}
+
+	return nil
+}
+
+func (s *Service) seedRolesInDB(ctx context.Context, registrations []accesscontrol.RoleRegistration, rolesSnapshot map[string][]accesscontrol.Permission) error {
 	if s.seeder != nil {
 		if err := s.seeder.SeedRoles(ctx, registrations); err != nil {
 			return err
@@ -622,11 +635,7 @@ func (s *Service) RegisterFixedRoles(ctx context.Context) error {
 		}
 	}
 
-	if err := s.refreshBasicRolePermissionsInDB(ctx, rolesSnapshot); err != nil {
-		return err
-	}
-
-	return nil
+	return s.refreshBasicRolePermissionsInDB(ctx, rolesSnapshot)
 }
 
 // getBasicRolePermissionsSnapshotFromRegistrationsLocked computes the desired basic role permissions from the

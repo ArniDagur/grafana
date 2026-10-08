@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/grafana/grafana/pkg/models/usertoken"
 	"github.com/grafana/grafana/pkg/registry"
@@ -16,6 +17,10 @@ import (
 const (
 	QuotaTargetSrv quota.TargetSrv = "auth"
 	QuotaTarget    quota.Target    = "session"
+
+	// TokenRotationRetryInterval is how long token rotation stays paused after it failed because the
+	// database is read-only, and when clients should try to rotate again.
+	TokenRotationRetryInterval = time.Minute
 )
 
 // Typed errors
@@ -24,6 +29,9 @@ var (
 	ErrInvalidSessionToken          = usertoken.ErrInvalidSessionToken
 	ErrExternalSessionNotFound      = errors.New("external session not found")
 	ErrExternalSessionTokenNotFound = errors.New("session token was nil")
+	// ErrTokenRotationUnavailable is returned when a token cannot be rotated because the database is read-only.
+	// The current token stays valid until it expires.
+	ErrTokenRotationUnavailable = errors.New("token rotation unavailable: database is read-only")
 )
 
 type (
@@ -87,6 +95,9 @@ type UserTokenService interface {
 
 	// RotateToken will always rotate a valid token
 	RotateToken(ctx context.Context, cmd RotateCommand) (*UserToken, error)
+	// RotationPaused reports whether token rotation recently failed because the database is read-only.
+	// While paused, callers should accept tokens that are due for rotation instead of requiring it.
+	RotationPaused() bool
 	RevokeToken(ctx context.Context, token *UserToken, soft bool) error
 	RevokeAllUserTokens(ctx context.Context, userID int64) error
 	GetUserToken(ctx context.Context, userID, userTokenID int64) (*UserToken, error)

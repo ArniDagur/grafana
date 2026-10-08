@@ -68,6 +68,14 @@ func TestSession_Authenticate(t *testing.T) {
 		RotatedAt:     time.Now().Unix(),
 	}
 
+	dueForRotationToken := &usertoken.UserToken{
+		Id:            1,
+		UserId:        1,
+		AuthToken:     "hashyToken",
+		AuthTokenSeen: true,
+		RotatedAt:     time.Now().Add(-11 * time.Minute).Unix(),
+	}
+
 	type fields struct {
 		authInfoService login.AuthInfoService
 		sessionService  auth.UserTokenService
@@ -125,6 +133,29 @@ func TestSession_Authenticate(t *testing.T) {
 			},
 			args:    args{r: &authn.Request{HTTPRequest: validHTTPReq}},
 			wantErr: true,
+		},
+		{
+			name: "should return identity for token that needs rotation while rotation is paused",
+			fields: fields{
+				sessionService: &authtest.FakeUserAuthTokenService{
+					LookupTokenProvider: func(ctx context.Context, unhashedToken string) (*auth.UserToken, error) {
+						return dueForRotationToken, nil
+					},
+					RotationPausedProvider: func() bool { return true },
+				},
+				authInfoService: &authinfotest.FakeService{ExpectedUserAuth: &login.UserAuth{}},
+			},
+			args: args{r: &authn.Request{HTTPRequest: validHTTPReq}},
+			wantID: &authn.Identity{
+				ID:           "1",
+				Type:         claims.TypeUser,
+				SessionToken: dueForRotationToken,
+				ClientParams: authn.ClientParams{
+					SyncPermissions: true,
+					FetchSyncedUser: true,
+				},
+			},
+			wantErr: false,
 		},
 		{
 			name: "should return identity for token that don't need rotation",

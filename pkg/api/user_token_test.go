@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"testing"
 	"time"
 
@@ -330,6 +331,57 @@ func TestHTTPServer_RotateUserAuthToken(t *testing.T) {
 			require.NoError(t, res.Body.Close())
 		})
 	}
+}
+
+func TestHTTPServer_RotateUserAuthToken_RotationUnavailable(t *testing.T) {
+	server := SetupAPITestServer(t, func(hs *HTTPServer) {
+		cfg := setting.NewCfg()
+		cfg.LoginCookieName = "grafana_session"
+		cfg.LoginMaxLifetime = 10 * time.Hour
+		hs.Cfg = cfg
+		hs.log = log.New()
+		hs.AuthTokenService = &authtest.FakeUserAuthTokenService{
+			RotateTokenProvider: func(ctx context.Context, cmd auth.RotateCommand) (*auth.UserToken, error) {
+				return nil, fmt.Errorf("%w: write rejected", auth.ErrTokenRotationUnavailable)
+			},
+		}
+	})
+
+	t.Run("API keeps the session and moves the expiry cookie forward", func(t *testing.T) {
+		req := server.NewPostRequest("/api/user/auth-tokens/rotate", nil)
+		req.AddCookie(&http.Cookie{Name: "grafana_session", Value: "123", Path: "/"})
+
+		before := time.Now()
+		res, err := server.Send(req)
+		require.NoError(t, err)
+		after := time.Now()
+		require.NoError(t, res.Body.Close())
+
+		assert.Equal(t, http.StatusOK, res.StatusCode)
+		cookies := res.Cookies()
+		require.Len(t, cookies, 1, "the session cookie must not be replaced")
+		assert.Equal(t, "grafana_session_expiry", cookies[0].Name)
+		expiry, err := strconv.ParseInt(cookies[0].Value, 10, 64)
+		require.NoError(t, err)
+		assert.GreaterOrEqual(t, expiry, before.Add(auth.TokenRotationRetryInterval).Unix())
+		assert.LessOrEqual(t, expiry, after.Add(auth.TokenRotationRetryInterval).Unix())
+	})
+
+	t.Run("redirect keeps the session and sends the user to the requested page", func(t *testing.T) {
+		req := server.NewGetRequest("/user/auth-tokens/rotate")
+		req.AddCookie(&http.Cookie{Name: "grafana_session", Value: "123", Path: "/"})
+		req.AddCookie(&http.Cookie{Name: "redirect_to", Value: url.QueryEscape("/d/abc"), Path: "/"})
+		server.HttpClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+
+		res, err := server.Send(req)
+		require.NoError(t, err)
+		require.NoError(t, res.Body.Close())
+
+		assert.Equal(t, http.StatusFound, res.StatusCode)
+		assert.Equal(t, "/d/abc", res.Header.Get("Location"))
+	})
 }
 
 func revokeUserAuthTokenScenario(t *testing.T, desc string, url string, routePattern string, cmd auth.RevokeAuthTokenCmd,

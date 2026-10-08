@@ -64,7 +64,8 @@ func (s *Session) Authenticate(ctx context.Context, r *authn.Request) (*authn.Id
 		return nil, err
 	}
 
-	if token.NeedsRotation(time.Duration(cfg.TokenRotationIntervalMinutes) * time.Minute) {
+	// While the database is read-only, rotation cannot succeed, so accept the token until it expires.
+	if token.NeedsRotation(time.Duration(cfg.TokenRotationIntervalMinutes)*time.Minute) && !s.sessionService.RotationPaused() {
 		return nil, authn.NewTokenNeedsRotationError(token.UserId)
 	}
 
