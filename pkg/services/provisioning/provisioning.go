@@ -48,6 +48,7 @@ import (
 	"github.com/grafana/grafana/pkg/services/provisioning/plugins"
 	"github.com/grafana/grafana/pkg/services/quota"
 	"github.com/grafana/grafana/pkg/services/secrets"
+	"github.com/grafana/grafana/pkg/services/sqlstore"
 	"github.com/grafana/grafana/pkg/services/user"
 	"github.com/grafana/grafana/pkg/setting"
 	"github.com/grafana/grafana/pkg/storage/legacysql/dualwrite"
@@ -142,17 +143,17 @@ func ProvideService(
 }
 
 func (ps *ProvisioningServiceImpl) starting(ctx context.Context) error {
-	if err := ps.ProvisionDatasources(ctx); err != nil {
+	if err := ps.ProvisionDatasources(ctx); err != nil && !ps.skipOnReadOnlyDatabase("datasources", err) {
 		ps.log.Error("Failed to provision data sources", "error", err)
 		return err
 	}
 
-	if err := ps.ProvisionPlugins(ctx); err != nil {
+	if err := ps.ProvisionPlugins(ctx); err != nil && !ps.skipOnReadOnlyDatabase("plugins", err) {
 		ps.log.Error("Failed to provision plugins", "error", err)
 		return err
 	}
 
-	if err := ps.ProvisionAlerting(ctx); err != nil {
+	if err := ps.ProvisionAlerting(ctx); err != nil && !ps.skipOnReadOnlyDatabase("alerting", err) {
 		ps.log.Error("Failed to provision alerting", "error", err)
 		return err
 	}
@@ -165,7 +166,7 @@ func (ps *ProvisioningServiceImpl) starting(ctx context.Context) error {
 		return err
 	}
 
-	if err := ps.provisionDashboardsWithRetry(ctx); err != nil {
+	if err := ps.provisionDashboardsWithRetry(ctx); err != nil && !ps.skipOnReadOnlyDatabase("dashboards", err) {
 		ps.log.Error("Failed to provision dashboard", "error", err)
 		// Consider the allow list of errors for which running the provisioning service should not
 		// fail. For now this includes only dashboards.ErrGetOrCreateFolder.
@@ -174,6 +175,16 @@ func (ps *ProvisioningServiceImpl) starting(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// skipOnReadOnlyDatabase reports whether a provisioning step failed because the database is read-only.
+// Such failures are skipped so Grafana can start with the state stored by the last successful provisioning.
+func (ps *ProvisioningServiceImpl) skipOnReadOnlyDatabase(step string, err error) bool {
+	if !sqlstore.IsReadOnlyError(err) {
+		return false
+	}
+	ps.log.Warn("Database is read-only, skipping provisioning step", "step", step, "error", err)
+	return true
 }
 
 // isRetriableFolderError reports whether a dashboard provisioning failure is a

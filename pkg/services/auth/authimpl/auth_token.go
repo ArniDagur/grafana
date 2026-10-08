@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/open-feature/go-sdk/openfeature"
@@ -24,6 +26,7 @@ import (
 	"github.com/grafana/grafana/pkg/services/featuremgmt"
 	"github.com/grafana/grafana/pkg/services/quota"
 	"github.com/grafana/grafana/pkg/services/secrets"
+	"github.com/grafana/grafana/pkg/services/sqlstore"
 	"github.com/grafana/grafana/pkg/setting"
 	"github.com/grafana/grafana/pkg/storage/legacysql"
 	"github.com/grafana/grafana/pkg/storage/unified/sql/sqltemplate"
@@ -88,6 +91,9 @@ type UserAuthTokenService struct {
 	singleflight         *singleflight.Group
 	features             featuremgmt.FeatureToggles
 	tracer               tracing.Tracer
+	// rotationPausedUntil is the time, in Unix nanoseconds, until which rotation is paused
+	// because the database rejected the last rotation as read-only.
+	rotationPausedUntil atomic.Int64
 }
 
 func (s *UserAuthTokenService) CreateToken(ctx context.Context, cmd *auth.CreateTokenCommand) (*auth.UserToken, error) {
@@ -230,11 +236,16 @@ func (s *UserAuthTokenService) LookupToken(ctx context.Context, unhashedToken st
 
 			return err
 		})
-		if err != nil {
+		if err != nil && !sqlstore.IsReadOnlyError(err) {
 			return nil, err
 		}
 
-		if affectedRows == 0 {
+		if err != nil {
+			// Keep the session usable while the database is read-only; the token keeps its stored state.
+			ctxLogger.Warn("Database is read-only, could not mark previous token as unseen", "tokenID", model.Id, "userID", model.UserId, "error", err)
+			model.AuthTokenSeen = origAuthTokenSeen
+			model.RotatedAt = origRotatedAt
+		} else if affectedRows == 0 {
 			ctxLogger.Debug("Prev seen token unchanged", "tokenID", model.Id, "userID", model.UserId, "clientIP", model.ClientIp, "userAgent", model.UserAgent, "authToken", model.AuthToken)
 
 			graceEnabled := openfeature.NewDefaultClient().Boolean(ctx, featuremgmt.FlagAuthTokenRotationGracePeriod, false, openfeature.TransactionContext(ctx))
@@ -266,11 +277,14 @@ func (s *UserAuthTokenService) LookupToken(ctx context.Context, unhashedToken st
 
 			return err
 		})
-		if err != nil {
+		if err != nil && !sqlstore.IsReadOnlyError(err) {
 			return nil, err
 		}
 
-		if affectedRows == 0 {
+		if err != nil {
+			// Keep the session usable while the database is read-only; the token is only marked as seen in memory.
+			ctxLogger.Warn("Database is read-only, could not mark token as seen", "tokenID", model.Id, "userID", model.UserId, "error", err)
+		} else if affectedRows == 0 {
 			ctxLogger.Debug("Seen wrong token", "tokenID", model.Id, "userID", model.UserId, "clientIP", model.ClientIp, "userAgent", model.UserAgent, "authToken", model.AuthToken)
 		} else {
 			ctxLogger.Debug("Seen token", "tokenID", model.Id, "userID", model.UserId, "clientIP", model.ClientIp, "userAgent", model.UserAgent, "authToken", model.AuthToken)
@@ -417,10 +431,23 @@ func (s *UserAuthTokenService) RotateToken(ctx context.Context, cmd auth.RotateC
 	})
 
 	if err != nil {
+		if sqlstore.IsReadOnlyError(err) {
+			s.pauseRotation()
+			s.log.FromContext(ctx).Warn("Database is read-only, pausing token rotation", "retryIn", auth.TokenRotationRetryInterval, "error", err)
+			return nil, fmt.Errorf("%w: %w", auth.ErrTokenRotationUnavailable, err)
+		}
 		return nil, err
 	}
 
 	return res.(*auth.UserToken), nil
+}
+
+func (s *UserAuthTokenService) RotationPaused() bool {
+	return getTime().UnixNano() < s.rotationPausedUntil.Load()
+}
+
+func (s *UserAuthTokenService) pauseRotation() {
+	s.rotationPausedUntil.Store(getTime().Add(auth.TokenRotationRetryInterval).UnixNano())
 }
 
 type rotateTokenQuery struct {

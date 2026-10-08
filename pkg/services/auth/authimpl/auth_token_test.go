@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/VividCortex/mysqlerr"
+	"github.com/go-sql-driver/mysql"
 	"github.com/open-feature/go-sdk/openfeature"
 	"github.com/open-feature/go-sdk/openfeature/memprovider"
 	"github.com/stretchr/testify/assert"
@@ -28,6 +30,7 @@ import (
 	"github.com/grafana/grafana/pkg/services/featuremgmt"
 	"github.com/grafana/grafana/pkg/services/quota"
 	"github.com/grafana/grafana/pkg/services/secrets/fakes"
+	"github.com/grafana/grafana/pkg/services/sqlstore"
 	"github.com/grafana/grafana/pkg/services/user"
 	"github.com/grafana/grafana/pkg/setting"
 	"github.com/grafana/grafana/pkg/storage/legacysql"
@@ -1153,5 +1156,135 @@ func TestIntegrationBatchRevokeAllUserTokens(t *testing.T) {
 			require.Nil(t, err)
 			require.Equal(t, 0, len(tokens))
 		}
+	})
+}
+
+// readOnlyDB simulates a MySQL primary that was switched to read-only: reads work and writes are rejected.
+type readOnlyDB struct {
+	db.DB
+}
+
+var errReadOnlyDB = &mysql.MySQLError{
+	Number:  mysqlerr.ER_OPTION_PREVENTS_STATEMENT,
+	Message: "The MySQL server is running with the --read-only option so it cannot execute this statement",
+}
+
+func (readOnlyDB) WithTransactionalDbSession(context.Context, sqlstore.DBTransactionFunc) error {
+	return errReadOnlyDB
+}
+
+// InTransaction runs fn and then fails, so any write fn made is rolled back as if the server had rejected it.
+func (d readOnlyDB) InTransaction(ctx context.Context, fn func(ctx context.Context) error) error {
+	return d.DB.InTransaction(ctx, func(ctx context.Context) error {
+		if err := fn(ctx); err != nil {
+			return err
+		}
+		return errReadOnlyDB
+	})
+}
+
+func TestIntegrationUserAuthTokenReadOnlyDatabase(t *testing.T) {
+	testutil.SkipIntegrationTestInShortMode(t)
+
+	usr := &user.User{ID: int64(10)}
+	now := time.Date(2018, 12, 13, 13, 45, 0, 0, time.UTC)
+	getTime = func() time.Time { return now }
+	t.Cleanup(func() { getTime = time.Now })
+
+	advanceTime := func(d time.Duration) {
+		currentTime := getTime()
+		getTime = func() time.Time { return currentTime.Add(d) }
+	}
+
+	setReadOnly := func(c *testContext, readOnly bool) {
+		store := c.sqlstore
+		if readOnly {
+			store = readOnlyDB{DB: c.sqlstore}
+		}
+		c.tokenService.sql = legacysql.NewDatabaseProvider(store)
+	}
+
+	createToken := func(t *testing.T, c *testContext) *auth.UserToken {
+		t.Helper()
+		token, err := c.tokenService.CreateToken(context.Background(), &auth.CreateTokenCommand{User: usr})
+		require.NoError(t, err)
+		return token
+	}
+
+	t.Run("LookupToken returns an unseen token without persisting that it was seen", func(t *testing.T) {
+		c := createTestContext(t)
+		token := createToken(t, c)
+		setReadOnly(c, true)
+
+		lookedUp, err := c.tokenService.LookupToken(context.Background(), token.UnhashedToken)
+		require.NoError(t, err)
+		assert.True(t, lookedUp.AuthTokenSeen)
+
+		stored, err := c.getAuthTokenByID(token.Id)
+		require.NoError(t, err)
+		assert.False(t, stored.AuthTokenSeen)
+	})
+
+	t.Run("LookupToken with the previous token keeps the stored rotation state", func(t *testing.T) {
+		c := createTestContext(t)
+		initial := createToken(t, c)
+		_, err := c.tokenService.LookupToken(context.Background(), initial.UnhashedToken)
+		require.NoError(t, err)
+
+		advanceTime(SkipRotationTime + time.Second)
+		current, err := c.tokenService.RotateToken(context.Background(), auth.RotateCommand{UnHashedToken: initial.UnhashedToken})
+		require.NoError(t, err)
+		_, err = c.tokenService.LookupToken(context.Background(), current.UnhashedToken)
+		require.NoError(t, err)
+		before, err := c.getAuthTokenByID(current.Id)
+		require.NoError(t, err)
+		require.True(t, before.AuthTokenSeen)
+
+		advanceTime(time.Hour)
+		setReadOnly(c, true)
+		lookedUp, err := c.tokenService.LookupToken(context.Background(), initial.UnhashedToken)
+		require.NoError(t, err)
+		assert.True(t, lookedUp.AuthTokenSeen)
+		assert.Equal(t, before.RotatedAt, lookedUp.RotatedAt)
+
+		after, err := c.getAuthTokenByID(current.Id)
+		require.NoError(t, err)
+		assert.True(t, after.AuthTokenSeen)
+		assert.Equal(t, before.RotatedAt, after.RotatedAt)
+	})
+
+	t.Run("RotateToken pauses rotation until the retry interval has passed", func(t *testing.T) {
+		c := createTestContext(t)
+		token := createToken(t, c)
+		_, err := c.tokenService.LookupToken(context.Background(), token.UnhashedToken)
+		require.NoError(t, err)
+
+		advanceTime(11 * time.Minute)
+		setReadOnly(c, true)
+		_, err = c.tokenService.RotateToken(context.Background(), auth.RotateCommand{UnHashedToken: token.UnhashedToken})
+		require.ErrorIs(t, err, auth.ErrTokenRotationUnavailable)
+		assert.True(t, c.tokenService.RotationPaused())
+
+		stored, err := c.getAuthTokenByID(token.Id)
+		require.NoError(t, err)
+		assert.Equal(t, token.AuthToken, stored.AuthToken, "the rotation must not be persisted")
+
+		advanceTime(auth.TokenRotationRetryInterval + time.Second)
+		assert.False(t, c.tokenService.RotationPaused())
+
+		setReadOnly(c, false)
+		rotated, err := c.tokenService.RotateToken(context.Background(), auth.RotateCommand{UnHashedToken: token.UnhashedToken})
+		require.NoError(t, err)
+		assert.NotEqual(t, token.UnhashedToken, rotated.UnhashedToken)
+	})
+
+	t.Run("RotateToken does not pause rotation for other errors", func(t *testing.T) {
+		c := createTestContext(t)
+		setReadOnly(c, true)
+
+		_, err := c.tokenService.RotateToken(context.Background(), auth.RotateCommand{UnHashedToken: "unknown"})
+		require.ErrorIs(t, err, auth.ErrUserTokenNotFound)
+		assert.NotErrorIs(t, err, auth.ErrTokenRotationUnavailable)
+		assert.False(t, c.tokenService.RotationPaused())
 	})
 }

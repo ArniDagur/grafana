@@ -138,6 +138,12 @@ func (hs *HTTPServer) rotateToken(c *contextmodel.ReqContext) error {
 		IP:            ip,
 		UserAgent:     c.Req.UserAgent(),
 	})
+	if errors.Is(err, auth.ErrTokenRotationUnavailable) {
+		// Keep the current session and move the expiry cookie forward, so the frontend
+		// retries rotation later instead of immediately.
+		authn.WriteSessionExpiryCookie(c.Resp, hs.Cfg, time.Now().Add(auth.TokenRotationRetryInterval))
+		return nil
+	}
 	if err != nil {
 		return err
 	}

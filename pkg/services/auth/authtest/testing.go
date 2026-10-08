@@ -31,6 +31,7 @@ type FakeUserAuthTokenService struct {
 	GetUserTokensProvider               func(ctx context.Context, userID int64) ([]*auth.UserToken, error)
 	GetUserRevokedTokensProvider        func(ctx context.Context, userID int64) ([]*auth.UserToken, error)
 	BatchRevokedTokenProvider           func(ctx context.Context, userIDs []int64) error
+	RotationPausedProvider              func() bool
 }
 
 func NewFakeUserAuthTokenService() *FakeUserAuthTokenService {
@@ -86,6 +87,13 @@ func (s *FakeUserAuthTokenService) CreateToken(ctx context.Context, cmd *auth.Cr
 
 func (s *FakeUserAuthTokenService) RotateToken(ctx context.Context, cmd auth.RotateCommand) (*auth.UserToken, error) {
 	return s.RotateTokenProvider(ctx, cmd)
+}
+
+func (s *FakeUserAuthTokenService) RotationPaused() bool {
+	if s.RotationPausedProvider == nil {
+		return false
+	}
+	return s.RotationPausedProvider()
 }
 
 func (s *FakeUserAuthTokenService) GetTokenByExternalSessionID(ctx context.Context, externalSessionID int64) (*auth.UserToken, error) {
